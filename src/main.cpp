@@ -7,6 +7,8 @@
 #include <WiFiManager.h>
 #include <time.h>
 #include <memory>
+#include <algorithm>
+#include <vector>
 
 #include "root_certificate.h"
 
@@ -56,7 +58,20 @@ struct Snapshot {
   Details details[rows];
 };
 
+struct CatalogEntry {
+  Entry summary;
+  Details details;
+};
+
+struct FreeRecord {
+  void operator()(CatalogEntry* record) const { free(record); }
+};
+using Record = std::unique_ptr<CatalogEntry, FreeRecord>;
+using Catalog = std::vector<Record>;
+
 Snapshot current{};
+Catalog catalog;
+size_t listPage;
 size_t selected;
 size_t drawnSelection;
 bool detailOpen;
@@ -94,7 +109,7 @@ int nextToken(Stream& stream) {
   return static_cast<unsigned char>(byte);
 }
 
-bool fetchCatalog(Snapshot& snapshot) {
+bool fetchCatalog(Catalog& records) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   struct tm utc;
@@ -145,27 +160,18 @@ bool fetchCatalog(Snapshot& snapshot) {
     snprintf(entry.product, sizeof(entry.product), "%s / %s",
              record["vendorProject"] | "", record["product"] | "");
 
-    ++snapshot.summary.count;
-    auto& entries = snapshot.summary.entries;
-    for (size_t i = 0; i < rows; ++i) {
-      const int dateOrder = strcmp(entry.added, entries[i].added);
-      if (dateOrder < 0 || (dateOrder == 0 && strcmp(entry.id, entries[i].id) <= 0)) continue;
-
-      for (size_t j = rows - 1; j > i; --j) {
-        entries[j] = entries[j - 1];
-        snapshot.details[j] = snapshot.details[j - 1];
-      }
-      entries[i] = entry;
-      auto& details = snapshot.details[i];
-      details = {};
-      strlcpy(details.description, record["shortDescription"] | "", sizeof(details.description));
-      strlcpy(details.action, record["requiredAction"] | "", sizeof(details.action));
-      strlcpy(details.ransomware, record["knownRansomwareCampaignUse"] | "", sizeof(details.ransomware));
-      break;
-    }
+    void* memory = ps_malloc(sizeof(CatalogEntry));
+    if (!memory) return false;
+    Record item(new (memory) CatalogEntry{});
+    item->summary = entry;
+    auto& details = item->details;
+    strlcpy(details.description, record["shortDescription"] | "", sizeof(details.description));
+    strlcpy(details.action, record["requiredAction"] | "", sizeof(details.action));
+    strlcpy(details.ransomware, record["knownRansomwareCampaignUse"] | "", sizeof(details.ransomware));
+    records.push_back(std::move(item));
 
     const int separator = nextToken(stream);
-    if (separator == ']') return nextToken(stream) == '}' && snapshot.summary.count > 0;
+    if (separator == ']') return nextToken(stream) == '}' && !records.empty();
     if (separator != ',') return false;
   }
 }
@@ -176,8 +182,21 @@ void textAt(Adafruit_GFX& canvas, int x, int y, int size, const char* text) {
   canvas.print(text);
 }
 
+size_t pageCount() {
+  return catalog.empty() ? 1 : (catalog.size() + rows - 1) / rows;
+}
+
 size_t visibleEntries() {
-  return min(static_cast<size_t>(current.summary.count), rows);
+  if (catalog.empty()) return min(static_cast<size_t>(current.summary.count), rows);
+  return min(catalog.size() - listPage * rows, rows);
+}
+
+const Entry& entryAt(size_t row) {
+  return catalog.empty() ? current.summary.entries[row] : catalog[listPage * rows + row]->summary;
+}
+
+const Details& detailsAt(size_t row) {
+  return catalog.empty() ? current.details[row] : catalog[listPage * rows + row]->details;
 }
 
 String displayText(const char* text) {
@@ -191,8 +210,8 @@ String displayText(const char* text) {
 }
 
 void drawDetails(Adafruit_GFX& display) {
-  const auto& entry = current.summary.entries[selected];
-  const auto& details = current.details[selected];
+  const auto& entry = entryAt(selected);
+  const auto& details = detailsAt(selected);
   char dates[64];
   snprintf(dates, sizeof(dates), "Added %s     CISA due %s", entry.added, entry.due);
   textAt(display, 12, 54, 1, dates);
@@ -246,7 +265,7 @@ void draw(Panel& display, const char* status, bool wifiSetup) {
     display.fillRect(0, 0, width, 44, GxEPD_BLACK);
     display.setTextColor(GxEPD_WHITE);
     textAt(display, 12, 10, detailOpen && !wifiSetup ? 2 : 3,
-           detailOpen && !wifiSetup ? current.summary.entries[selected].id : "CISA KEV");
+           detailOpen && !wifiSetup ? entryAt(selected).id : "CISA KEV");
     display.setTextColor(GxEPD_BLACK);
 
     if (wifiSetup) {
@@ -262,7 +281,7 @@ void draw(Panel& display, const char* status, bool wifiSetup) {
       textAt(display, 12, 268, 1, page);
     } else {
       for (size_t i = 0; i < visibleEntries(); ++i) {
-        const auto& entry = current.summary.entries[i];
+        const auto& entry = entryAt(i);
         const int y = firstRowY + i * rowHeight;
         textAt(display, markerWidth, y, 2, entry.id);
         String product = displayText(entry.product);
@@ -300,10 +319,12 @@ void show(const char* status, bool wifiSetup = false) {
 
 void showCatalog() {
   char status[64];
-  if (showingError) {
-    snprintf(status, sizeof(status), "Update failed | MENU retries");
+  if (!visibleEntries()) {
+    snprintf(status, sizeof(status), "Catalog unavailable | MENU retries");
   } else {
-    snprintf(status, sizeof(status), "Turn to select | Press for details | MENU refresh");
+    snprintf(status, sizeof(status), "KEVs %u/%u | MENU next%s",
+             static_cast<unsigned>(listPage + 1), static_cast<unsigned>(pageCount()),
+             showingError ? " | Offline data" : "");
   }
   show(status);
   drawnSelection = selected;
@@ -315,7 +336,7 @@ bool saveCatalog() {
   JsonDocument cache;
   cache["count"] = current.summary.count;
   JsonArray entries = cache["entries"].to<JsonArray>();
-  for (size_t i = 0; i < visibleEntries(); ++i) {
+  for (size_t i = 0; i < min(static_cast<size_t>(current.summary.count), rows); ++i) {
     const auto& entry = current.summary.entries[i];
     const auto& details = current.details[i];
     JsonArray row = entries.add<JsonArray>();
@@ -365,31 +386,48 @@ void loadCatalog() {
 }
 
 void refresh() {
-  // Keep the staging buffer off the Arduino loop task's stack.
-  static Snapshot candidate;
-  memset(&candidate, 0, sizeof(candidate));
+  Catalog candidate;
   if (fetchCatalog(candidate)) {
-    const bool changed = memcmp(&current, &candidate, sizeof(candidate)) != 0;
+    std::sort(candidate.begin(), candidate.end(), [](const Record& left, const Record& right) {
+      const int dateOrder = strcmp(left->summary.added, right->summary.added);
+      return dateOrder != 0 ? dateOrder > 0 : strcmp(left->summary.id, right->summary.id) > 0;
+    });
+    const bool changed = catalog.size() != candidate.size() ||
+        !std::equal(catalog.begin(), catalog.end(), candidate.begin(), [](const Record& left, const Record& right) {
+          return memcmp(&left->summary, &right->summary, sizeof(Entry)) == 0 &&
+                 memcmp(&left->details, &right->details, sizeof(Details)) == 0;
+        });
     const bool wasShowingError = showingError;
     showingError = false;
     if (changed) {
       char selectedId[sizeof(Entry::id)];
-      strlcpy(selectedId, current.summary.entries[selected].id, sizeof(selectedId));
-      current = candidate;
-      if (saveCatalog()) {
-        if (settings.isKey("catalog")) settings.remove("catalog");
+      strlcpy(selectedId, entryAt(selected).id, sizeof(selectedId));
+      catalog.swap(candidate);
+      const auto match = std::find_if(catalog.begin(), catalog.end(), [&](const Record& record) {
+        return strcmp(selectedId, record->summary.id) == 0;
+      });
+      if (match != catalog.end()) {
+        const size_t index = match - catalog.begin();
+        listPage = index / rows;
+        selected = index % rows;
       } else {
-        Serial.println("Could not save KEV cache");
-      }
-      size_t index = 0;
-      while (index < visibleEntries() && strcmp(selectedId, current.summary.entries[index].id)) ++index;
-      if (index < visibleEntries()) {
-        selected = index;
-      } else {
+        listPage = min(listPage, pageCount() - 1);
         selected = 0;
         detailOpen = false;
       }
       detailPage = 0;
+
+      static Snapshot latest;
+      memset(&latest, 0, sizeof(latest));
+      latest.summary.count = catalog.size();
+      for (size_t i = 0; i < min(catalog.size(), rows); ++i) {
+        latest.summary.entries[i] = catalog[i]->summary;
+        latest.details[i] = catalog[i]->details;
+      }
+      if (memcmp(&current, &latest, sizeof(current)) != 0) {
+        current = latest;
+        if (!saveCatalog()) Serial.println("Could not save KEV cache");
+      }
     }
     if (changed || wasShowingError || !dashboardDrawn) showCatalog();
     nextRefresh = millis() + refreshMs;
@@ -447,13 +485,19 @@ void setup() {
 
 void loop() {
   static Button menu{menuPin}, back{exitPin}, previous{previousPin}, next{nextPin}, select{selectPin};
-  const bool refreshPressed = menu.pressed();
+  const bool menuPressed = menu.pressed();
   const bool backPressed = back.pressed();
   const bool selectPressed = select.pressed();
   const int step = static_cast<int>(next.pressed()) - static_cast<int>(previous.pressed());
   const int count = visibleEntries();
 
-  if (count > 0) {
+  if (menuPressed && count > 0 && !detailOpen && pageCount() > 1) {
+    listPage = (listPage + 1) % pageCount();
+    selected = 0;
+    showCatalog();
+    Serial.printf("KEV page %u/%u\n", static_cast<unsigned>(listPage + 1),
+                  static_cast<unsigned>(pageCount()));
+  } else if (count > 0) {
     if (selectPressed || (backPressed && detailOpen)) {
       detailOpen = !detailOpen;
       detailPage = 0;
@@ -474,7 +518,7 @@ void loop() {
     }
   }
 
-  if (refreshPressed || static_cast<int32_t>(millis() - nextRefresh) >= 0) refresh();
+  if ((menuPressed && count == 0) || static_cast<int32_t>(millis() - nextRefresh) >= 0) refresh();
   if (redrawPending && static_cast<int32_t>(millis() - redrawAt) >= 0) {
     if (detailOpen || !dashboardDrawn) {
       showCatalog();
