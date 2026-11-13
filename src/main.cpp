@@ -19,6 +19,9 @@ constexpr int selectPin = 5;
 constexpr int width = 400;
 constexpr int height = 300;
 constexpr size_t rows = 5;
+constexpr int firstRowY = 50;
+constexpr int rowHeight = 45;
+constexpr int markerWidth = 16;
 constexpr uint32_t refreshMs = 60UL * 60 * 1000;
 constexpr uint32_t retryMs = 5UL * 60 * 1000;
 constexpr char catalogUrl[] =
@@ -55,6 +58,7 @@ struct Snapshot {
 
 Snapshot current{};
 size_t selected;
+size_t drawnSelection;
 bool detailOpen;
 size_t detailPage;
 size_t detailPageCount = 1;
@@ -226,9 +230,13 @@ void drawDetails(Adafruit_GFX& display) {
   detailPageCount = max(size_t{1}, (line + linesPerPage - 1) / linesPerPage);
 }
 
+void drawSelectionMarker(Adafruit_GFX& display) {
+  const int y = firstRowY + selected * rowHeight;
+  display.fillTriangle(4, y + 2, 4, y + 14, 11, y + 8, GxEPD_BLACK);
+}
+
 template<class Panel>
 void draw(Panel& display, const char* status, bool wifiSetup) {
-  display.init(115200, true, 10, false);
   display.setRotation(0);
   display.setFullWindow();
   display.setTextWrap(false);
@@ -255,25 +263,34 @@ void draw(Panel& display, const char* status, bool wifiSetup) {
     } else {
       for (size_t i = 0; i < visibleEntries(); ++i) {
         const auto& entry = current.summary.entries[i];
-        const int y = 50 + i * 45;
-        if (i == selected) {
-          display.fillRect(0, y - 3, width, 42, GxEPD_BLACK);
-          display.setTextColor(GxEPD_WHITE);
-        }
-        textAt(display, 12, y, 2, entry.id);
+        const int y = firstRowY + i * rowHeight;
+        textAt(display, markerWidth, y, 2, entry.id);
         String product = displayText(entry.product);
         if (product.length() > 62) product = product.substring(0, 59) + "...";
-        textAt(display, 12, y + 17, 1, product.c_str());
+        textAt(display, markerWidth, y + 17, 1, product.c_str());
         char dates[50];
         snprintf(dates, sizeof(dates), "Added %s     Due %s", entry.added, entry.due);
-        textAt(display, 12, y + 28, 1, dates);
-        display.setTextColor(GxEPD_BLACK);
-        display.drawFastHLine(12, y + 40, 376, GxEPD_BLACK);
+        textAt(display, markerWidth, y + 28, 1, dates);
+        display.drawFastHLine(markerWidth, y + 40, 372, GxEPD_BLACK);
       }
+      if (visibleEntries()) drawSelectionMarker(display);
     }
     textAt(display, 12, 282, 1, status);
   } while (display.nextPage());
-  display.hibernate();
+}
+
+template<class Panel>
+void moveSelectionMarker(Panel& display) {
+  const int top = firstRowY + min(selected, drawnSelection) * rowHeight;
+  const int bottom = firstRowY + max(selected, drawnSelection) * rowHeight + 15;
+  display.setPartialWindow(0, top, markerWidth, bottom - top);
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    drawSelectionMarker(display);
+  } while (display.nextPage());
+  // Keep controller RAM available for the next partial update.
+  display.powerOff();
 }
 
 void show(const char* status, bool wifiSetup = false) {
@@ -289,6 +306,7 @@ void showCatalog() {
     snprintf(status, sizeof(status), "Turn to select | Press for details | MENU refresh");
   }
   show(status);
+  drawnSelection = selected;
   dashboardDrawn = true;
   redrawPending = false;
 }
@@ -406,6 +424,8 @@ void setup() {
     alternatePanel = !alternatePanel;
     settings.putBool("alternate", alternatePanel);
   }
+  if (alternatePanel) uc.init(115200, true, 10, false);
+  else ssd.init(115200, true, 10, false);
   Serial.printf("Panel: %s\n", alternatePanel ? "UC8276C" : "SSD1683");
   loadCatalog();
 
@@ -440,16 +460,30 @@ void loop() {
       showCatalog();
     } else if (step != 0) {
       if (detailOpen) {
-        detailPage = constrain(static_cast<int>(detailPage) + step, 0, static_cast<int>(detailPageCount) - 1);
+        const size_t page = constrain(static_cast<int>(detailPage) + step, 0,
+                                      static_cast<int>(detailPageCount) - 1);
+        if (page != detailPage) {
+          detailPage = page;
+          redrawPending = true;
+        }
       } else {
         selected = (static_cast<int>(selected) + step + count) % count;
+        redrawPending = selected != drawnSelection;
       }
-      redrawPending = true;
-      redrawAt = millis() + 250;
+      redrawAt = millis() + 100;
     }
   }
 
   if (refreshPressed || static_cast<int32_t>(millis() - nextRefresh) >= 0) refresh();
-  if (redrawPending && static_cast<int32_t>(millis() - redrawAt) >= 0) showCatalog();
+  if (redrawPending && static_cast<int32_t>(millis() - redrawAt) >= 0) {
+    if (detailOpen || !dashboardDrawn) {
+      showCatalog();
+    } else {
+      if (alternatePanel) moveSelectionMarker(uc);
+      else moveSelectionMarker(ssd);
+      drawnSelection = selected;
+      redrawPending = false;
+    }
+  }
   delay(5);
 }
